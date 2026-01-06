@@ -746,12 +746,15 @@ class GitbookDownloader:
             if resolved_url in downloaded:
                 local_path = downloaded[resolved_url]
             else:
+                # logger.info(f"Downloading image: {resolved_url}")
+                await asyncio.sleep(self.delay)
                 image_bytes, detected_ext = await self._fetch_image_bytes(resolved_url)
                 if image_bytes is None:
                     continue
                 base_name = self._sanitize_image_basename(urlparse(resolved_url).path)
                 ext = detected_ext or "png"
                 local_path = self._save_image_with_dedup(image_bytes, base_name, ext)
+                logger.info(f"Saved image: {resolved_url} -> {local_path}")
                 downloaded[resolved_url] = local_path
 
             rewrite_map[src_clean] = local_path
@@ -766,18 +769,39 @@ class GitbookDownloader:
         return image_pattern.sub(replacer, markdown_content)
 
     async def _fetch_image_bytes(self, url: str):
-        try:
-            async with self.session.get(url) as response:
-                if response.status != 200:
-                    logger.warning(f"Failed to download image {url}: HTTP {response.status}")
+        retry_count = 0
+        current_delay = self.retry_delay
+        while retry_count < self.max_retries:
+            try:
+                async with self.session.get(url) as response:
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After", "60")
+                        wait_time = int(retry_after)
+                        self.status.rate_limit_reset = wait_time
+                        logger.warning(f"Image rate limited. Waiting {wait_time} seconds")
+                        await asyncio.sleep(wait_time)
+                        retry_count += 1
+                        continue
+
+                    if response.status == 200:
+                        data = await response.read()
+                        content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                        ext = self._detect_image_extension(content_type, data)
+                        return data, ext
+                    else:
+                        logger.warning(f"Failed to download image {url}: HTTP {response.status}")
+                        return None, None
+
+            except Exception as e:
+                logger.warning(f"Error downloading image {url}: {e}")
+                if retry_count < self.max_retries - 1:
+                    await asyncio.sleep(current_delay)
+                    current_delay *= 2
+                    retry_count += 1
+                else:
                     return None, None
-                data = await response.read()
-                content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-                ext = self._detect_image_extension(content_type, data)
-                return data, ext
-        except Exception as e:
-            logger.warning(f"Error downloading image {url}: {e}")
-            return None, None
+
+        return None, None
 
     def _detect_image_extension(self, content_type: str, data: bytes) -> Optional[str]:
         ct_map = {
@@ -820,12 +844,12 @@ class GitbookDownloader:
         ext = ext.lstrip(".") or "png"
         digest_new = hashlib.md5(data).hexdigest()
 
-        def candidate_path(idx: Optional[int] = None) -> Path:
-            suffix = f"_{idx:03d}" if idx is not None else ""
+        def candidate_path(idx: int) -> Path:
+            suffix = f"_{idx:03d}"
             return self.image_output_dir / f"{base_name}{suffix}.{ext}"
 
-        # Try base filename first, then _000.._999
-        for idx in [None] + list(range(1000)):
+        # Try _001.._999
+        for idx in range(1, 1000):
             path = candidate_path(idx)
             if path.exists():
                 try:
