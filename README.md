@@ -45,13 +45,32 @@ poetry install
 
 Download documentation to a markdown file:
 ```bash
-poetry run python cli.py download <url> --output <output_file.md>
+poetry run python cli.py download <url> --output <output_file.md> [--site-prefix <prefix>] [--image] [--image-ignore-prefix]
 ```
 
 Example:
 ```bash
-poetry run python cli.py download https://docs.example.com/ -o docs.md
+poetry run python cli.py download https://docs.example.com/ -o docs.md --site-prefix https://docs.example.com -i -I
 ```
+
+To store images in a custom folder (e.g., `assets/`):
+```bash
+poetry run python cli.py download https://docs.example.com/ -o docs.md -i -d assets
+```
+
+## Available options:
+
+- `--output`, `-o`: Output markdown file path. Prints to stdout if omitted.
+- `--native`, `-n`: Request native `.md` endpoints when available.
+- `--site-prefix`, `-s`: Restrict page crawling to this prefix to avoid cross-site/cross-directory fetches.
+- `--image`, `-i`: Parse markdown image links, download to `images/`, and rewrite links to local relative paths.
+- `--image-dir`, `-d`: Destination folder for downloaded images (default: `images`).
+- `--image-ignore-prefix`, `-I`: When downloading images, bypass `--site-prefix` filtering: pages still obey `--site-prefix`, but image URLs are fetched even if they are off-prefix. Images are still deduped by MD5 and stored with sanitized names and detected extensions.
+
+`-I` behavior details:
+- Page fetching continues to honor `--site-prefix`; only image downloads ignore it.
+- Image filenames keep only `[A-Za-z0-9_]`, truncated to 12 chars; extension is detected from `Content-Type`/magic bytes.
+- If a same-named file exists: matching MD5 -> skipped; differing MD5 -> writes with `_000`..`_999` suffix (then hash suffix as last resort).
 
 ### Using Web Interface
 

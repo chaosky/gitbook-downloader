@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional, List, Set
 from urllib.parse import urljoin, urlparse
+from pathlib import Path
 import asyncio
 import hashlib
 import logging
@@ -284,11 +285,27 @@ class DownloadStatus:
 
 
 class GitbookDownloader:
-    def __init__(self, url, native_md: bool):
+    def __init__(
+        self,
+        url,
+        native_md: bool,
+        site_prefix: Optional[str] = None,
+        download_images: bool = False,
+        ignore_image_prefix: bool = False,
+        image_output_dir: str = "images",
+    ):
         # Preserve trailing slash so urljoin treats base_url as a directory
         # This prevents dropping path prefixes like /scf-handbook when joining relative URLs
         self.base_url = url.rstrip("/") + "/"
+        self.allowed_prefix = (site_prefix or url).rstrip("/")
+        if site_prefix and not url.startswith(self.allowed_prefix):
+            logger.warning(
+                "Base URL does not match site prefix; base may be skipped for prefix enforcement"
+            )
         self.native_md = native_md
+        self.download_images = download_images
+        self.ignore_image_prefix = ignore_image_prefix
+        self.image_output_dir = Path(image_output_dir)
         self.status = DownloadStatus()
         self.session = None
         self.visited_urls = set()
@@ -300,6 +317,11 @@ class GitbookDownloader:
         self.has_global_nav = False  # True for sites like Mintlify where nav is identical on all pages
         # Navigation extractors in priority order
         self.extractors = [MintlifyExtractor(), VocsExtractor(), GitBookExtractor(), FallbackExtractor()]
+
+    def _is_allowed_url(self, url: str) -> bool:
+        normalized_url = url.rstrip("/")
+        allowed = self.allowed_prefix.rstrip("/")
+        return normalized_url == allowed or normalized_url.startswith(f"{allowed}/")
 
     async def download(self):
         """Main download method"""
@@ -343,6 +365,9 @@ class GitbookDownloader:
                 if not markdown_content:
                     raise Exception("Failed to generate markdown content")
 
+                if self.download_images:
+                    markdown_content = await self._download_and_rewrite_images(markdown_content)
+
                 self.status.status = "completed"
                 return markdown_content
 
@@ -384,6 +409,11 @@ class GitbookDownloader:
 
                 # Add delay between requests
                 await asyncio.sleep(self.delay)
+
+                # Enforce site prefix restriction
+                if not self._is_allowed_url(link):
+                    logger.warning(f"Skipping URL outside prefix: {link}")
+                    continue
 
                 content = await self._fetch_page(link)
                 self.visited_urls.add(link)
@@ -671,13 +701,144 @@ class GitbookDownloader:
 
                         # Deduplicate while preserving order
                         seen = set()
-                        return [
-                            item for item in nav_links
-                            if item[0] is None or (item[0] not in seen and not seen.add(item[0]))
-                        ]
+                        filtered = []
+                        for item in nav_links:
+                            link, title, depth = item
+                            if link is None or self._is_allowed_url(link):
+                                if link is None or (link not in seen and not seen.add(link)):
+                                    filtered.append(item)
+                            else:
+                                logger.warning(f"Skipping nav link outside prefix: {link}")
+                        return filtered
 
             return []
 
         except Exception as e:
             logger.error(f"Error extracting nav links: {str(e)}")
             return []
+
+    async def _download_and_rewrite_images(self, markdown_content: str) -> str:
+        """Download images referenced in markdown and rewrite links to local paths."""
+        image_pattern = re.compile(r"!\[(.*?)\]\((.*?)\)")
+        matches = image_pattern.findall(markdown_content)
+        if not matches:
+            return markdown_content
+
+        self.image_output_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: Dict[str, str] = {}
+        rewrite_map: Dict[str, str] = {}
+
+        for _, src in matches:
+            src_clean = src.strip()
+            if not src_clean or src_clean.startswith("data:") or src_clean.startswith("file:"):
+                continue
+
+            if re.match(r"^https?://", src_clean):
+                resolved_url = src_clean
+            else:
+                resolved_url = urljoin(self.base_url, src_clean)
+
+            if not self.ignore_image_prefix and not self._is_allowed_url(resolved_url):
+                logger.warning(f"Skipping image outside prefix: {resolved_url}")
+                continue
+
+            if resolved_url in downloaded:
+                local_path = downloaded[resolved_url]
+            else:
+                image_bytes, detected_ext = await self._fetch_image_bytes(resolved_url)
+                if image_bytes is None:
+                    continue
+                base_name = self._sanitize_image_basename(urlparse(resolved_url).path)
+                ext = detected_ext or "png"
+                local_path = self._save_image_with_dedup(image_bytes, base_name, ext)
+                downloaded[resolved_url] = local_path
+
+            rewrite_map[src_clean] = local_path
+
+        def replacer(match):
+            alt_text, src = match.group(1), match.group(2)
+            new_src = rewrite_map.get(src.strip())
+            if new_src:
+                return f"![{alt_text}]({new_src})"
+            return match.group(0)
+
+        return image_pattern.sub(replacer, markdown_content)
+
+    async def _fetch_image_bytes(self, url: str):
+        try:
+            async with self.session.get(url) as response:
+                if response.status != 200:
+                    logger.warning(f"Failed to download image {url}: HTTP {response.status}")
+                    return None, None
+                data = await response.read()
+                content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                ext = self._detect_image_extension(content_type, data)
+                return data, ext
+        except Exception as e:
+            logger.warning(f"Error downloading image {url}: {e}")
+            return None, None
+
+    def _detect_image_extension(self, content_type: str, data: bytes) -> Optional[str]:
+        ct_map = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/gif": "gif",
+            "image/webp": "webp",
+            "image/svg+xml": "svg",
+            "image/bmp": "bmp",
+        }
+        if content_type in ct_map:
+            return ct_map[content_type]
+        # Lightweight signature sniffing as imghdr was removed in Python 3.13
+        header = data[:12]
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if header.startswith(b"\xff\xd8\xff"):
+            return "jpg"
+        if header.startswith(b"GIF8"):
+            return "gif"
+        if header.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "webp"
+        if header.startswith(b"BM"):
+            return "bmp"
+        stripped = data.lstrip()
+        if stripped.startswith(b"<svg") or stripped.startswith(b"<?xml"):
+            return "svg"
+        return None
+
+    def _sanitize_image_basename(self, path: str) -> str:
+        name = Path(path).name or "image"
+        base = Path(name).stem
+        base = re.sub(r"[^A-Za-z0-9_]", "", base)
+        if not base:
+            base = "image"
+        return base[:12]
+
+    def _save_image_with_dedup(self, data: bytes, base_name: str, ext: str) -> str:
+        self.image_output_dir.mkdir(parents=True, exist_ok=True)
+        ext = ext.lstrip(".") or "png"
+        digest_new = hashlib.md5(data).hexdigest()
+
+        def candidate_path(idx: Optional[int] = None) -> Path:
+            suffix = f"_{idx:03d}" if idx is not None else ""
+            return self.image_output_dir / f"{base_name}{suffix}.{ext}"
+
+        # Try base filename first, then _000.._999
+        for idx in [None] + list(range(1000)):
+            path = candidate_path(idx)
+            if path.exists():
+                try:
+                    existing_digest = hashlib.md5(path.read_bytes()).hexdigest()
+                    if existing_digest == digest_new:
+                        return path.as_posix()
+                except Exception:
+                    pass
+                continue
+            path.write_bytes(data)
+            return path.as_posix()
+
+        # Fallback: if all taken, append full hash
+        fallback = self.image_output_dir / f"{base_name}_{digest_new[:8]}.{ext}"
+        fallback.write_bytes(data)
+        return fallback.as_posix()
